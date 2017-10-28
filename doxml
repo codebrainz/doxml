@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+
+import argparse
+import lxml.etree as ET
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+def parse(args):
+
+    class CapitalHelpFmt(argparse.HelpFormatter):
+        def add_usage(self, usage, actions, groups, prefix=None):
+            if prefix is None:
+                prefix = 'Usage: '
+            return super().add_usage(usage, actions, groups, prefix)
+
+    parser = argparse.ArgumentParser(
+        description='Produce XML output from source code comment documentation.',
+        add_help=False,
+        formatter_class=CapitalHelpFmt,
+        epilog='Written and maintained by Matthew Brush <mbrush@codebrainz.ca>.')
+    parser._positionals.title = 'Positional Arguments'
+    parser._optionals.title = 'Optional Arguments'
+
+    parser.add_argument('-h', '--help', action='help', default=argparse.SUPPRESS,
+        help='Show this help message and exit.')
+    parser.add_argument('-v', '--version', action='version',
+        version='%(prog)s 1.0', help='Show version information and exit.')
+    parser.add_argument('-o', '--output-file', metavar='FILE', default='-',
+        help="The XML file to write (default '-' for stdout).")
+    parser.add_argument('-i', '--include', metavar='PATTERNS', nargs='+', default=[],
+        help='Patterns of files to include from the given files/directories.')
+    parser.add_argument('-e', '--exclude', metavar='PATTERNS', nargs='+', default=[],
+        help='Patterns of files to exclude from the given files/directories.')
+    parser.add_argument('-c', '--config', metavar='FILE', default=None,
+        help='Additional options for Doxygen in a format similar to a Doxyfile.')
+    parser.add_argument('-d', '--dump-config', action='store_true', default=False,
+        help='Print the options that would be passed to Doxygen.')
+    parser.add_argument('INPUTS', default=['.'], nargs='*',
+        help='Files and/or directories to process.')
+
+    arguments = parser.parse_args(args[1:])
+
+    return {
+        'config_file': arguments.config,
+        'dump_config': arguments.dump_config,
+        'inputs': arguments.INPUTS,
+        'output_file': arguments.output_file,
+        'include_patterns': arguments.include,
+        'exclude_patterns': arguments.exclude
+    }
+
+def run(**options):
+
+    class DirChangeManager:
+        def __enter__(self):
+            self.orig_dir = os.getcwd()
+            self.dir = tempfile.TemporaryDirectory('.cdt')
+            self.work_dir = os.path.abspath(self.dir.name)
+            os.chdir(self.work_dir)
+            return self.work_dir
+        def __exit__(self, *args):
+            os.chdir(self.orig_dir)
+            self.dir.cleanup()
+
+    def read_config(fn):
+        fn = os.path.abspath(fn)
+        contents = ''
+        with open(fn, 'r') as f:
+            contents = f.read()
+            contents = re.sub(r'#.*$', '', contents)
+            contents = re.sub(r'\\\n', ' ', contents)
+            contents = re.sub(r'\n+', '\n', contents)
+        cfg = {}
+        for line in contents.split('\n'):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            key, value = line.split('=', maxsplit=1)
+            cfg[key.strip()] = value.strip()
+        return cfg
+
+    def have_doxygen(doxygen):
+        with open(os.devnull, 'w') as nul:
+            try:
+                cmd = [ doxygen, '--version' ]
+                res = subprocess.run(cmd, stdout=nul, stderr=nul)
+                if res.returncode != 0:
+                    raise Exception()
+                return True
+            except:
+                return False
+
+    DOXYGEN = os.environ.get('DOXYGEN', 'doxygen')
+
+    DOXYGEN_OPTIONS = {
+        'INPUT': '',
+        'OUTPUT_DIRECTORY': '.',
+        'FULL_PATH_NAMES': 'NO',
+        'FILE_PATTERNS': '',
+        'EXCLUDE_PATTERNS': '',
+        'GENERATE_HTML': 'NO',
+        'GENERATE_LATEX': 'NO',
+        'GENERATE_XML': 'YES',
+        'XML_PROGRAMLISTING': 'NO',
+    }
+
+    if not have_doxygen(DOXYGEN):
+        raise Exception(re.sub(r'\s+', ' ', f"""\
+            unable to launch '{DOXYGEN}', Doxygen must be in the available
+            from a directory in the 'PATH' environment variable as 'doxygen'
+            or specified directly via the 'DOXYGEN' environment variable'"""))
+
+    opts = dict(DOXYGEN_OPTIONS)
+
+    if 'config_file' in options and options['config_file'] is not None:
+        for k,v in read_config(options['config_file']):
+            opts[k] = v
+
+    opts['INPUT'] = ' '.join(os.path.abspath(i) for i in options.get('inputs', [ '.' ]))
+    opts['FILE_PATTERNS'] = ', '.join(options.get('include_patterns', []))
+    opts['EXCLUDE_PATTERNS'] = ', '.join(options.get('exclude_patterns', []))
+
+    with DirChangeManager() as temp_dir:
+
+        opts['OUTPUT_DIRECTORY'] = os.path.abspath(temp_dir)
+        conf = '\n'.join(sorted(f'{k} = {v}\n' for k,v in opts.items()))
+
+        for key in list(opts.keys()):
+            if not opts[key]:
+                del opts[key]
+
+        if 'dump_config' in options and options['dump_config']:
+            for k,v in sorted(opts.items()):
+                print(f'{k} = {v}')
+            sys.exit(0)
+
+        with open(os.devnull, 'w') as nul:
+
+            doxygen = os.environ.get('DOXYGEN', 'doxygen')
+            res = subprocess.run([doxygen, '-'], input=conf.encode('utf-8'), stdout=nul, stderr=nul)
+            if res.returncode != 0:
+                raise Exception(f"execution of doxygen failed with exit code {res.returncode}")
+
+            xml_parser = ET.XMLParser(remove_blank_text=True)
+            xml = ET.parse(os.path.join(temp_dir, 'xml', 'index.xml'), xml_parser)
+            xslt = ET.parse(os.path.join(temp_dir, 'xml', 'combine.xslt'))
+            transform = ET.XSLT(xslt)
+            new_xml = transform(xml)
+            for element in new_xml.xpath('.//*[not(*)][not(normalize-space())]'):
+                element.getparent().remove(element)
+            return ET.tostring(new_xml, encoding='utf-8', pretty_print=True).decode('utf-8').strip()
+
+def main(args):
+    sys.stdout.write(run(**parse(args)) + '\n')
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
